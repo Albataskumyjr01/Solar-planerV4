@@ -1,396 +1,345 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
 from io import BytesIO
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
 import datetime
 import math
 
-# -----------------------
-# Branding / Defaults
-# -----------------------
-BRAND = {
-    "name": "Annur Tech 💡",
-    "company": "ANNUR TECH SOLAR SOLUTIONS",
-    "motto": "Illuminating Innovation",
-    "phone": "09051693000",
-    "email": "albataskumyjr@gmail.com",
-    "address": "No 6 Kolo Drive, Behind Zuma Barrack, Tafa LGA, Niger State, Nigeria",
+# Branding info
+COMPANY = "ANNUR TECH SOLAR SOLUTIONS"
+MOTTO = "Illuminating Nigeria's Future"
+ADDRESS = "No 6 Kolo Drive, Behind Zuma Barrack, Tafa LGA, Niger State, Nigeria"
+PHONE = "+234 905 169 3000"
+EMAIL = "albataskumyjr@gmail.com"
+
+# Nigerian-specific component database
+NIGERIAN_SOLAR_PANELS = {
+    "Jinko Tiger 350W": {"price": 85000, "vmp": 35.5},
+    "Canadian Solar 400W": {"price": 105000, "vmp": 37.2},
+    "Trina Solar 450W": {"price": 125000, "vmp": 39.8},
 }
 
-# Common battery unit choices (Ah at given voltage; user can override)
-COMMON_BATTERIES = {
-    "Lead-Acid 225Ah (Trojan T-105)": 225,
-    "Lithium 200Ah (Pylontech US2000 ~200Ah)": 200,
-    "Custom (enter Ah below)": None,
+NIGERIAN_BATTERIES = {
+    "Trojan T-105 (225Ah)": {"price": 65000, "capacity": 225},
+    "Pylontech US2000 (200Ah)": {"price": 280000, "capacity": 200},
 }
 
-# -----------------------
-# Helper functions (calculations)
-# -----------------------
-def compute_loads_df(items):
-    """items: list of dicts with keys: name,watt,qty,hours"""
-    if not items:
-        return pd.DataFrame(columns=["name","watt","qty","hours","total_w","daily_Wh"])
-    rows = []
-    for it in items:
-        total_w = it["watt"] * it["qty"]
-        daily_wh = total_w * it["hours"]
-        rows.append({
-            "name": it["name"],
-            "watt": it["watt"],
-            "qty": it["qty"],
-            "hours": it["hours"],
-            "total_w": total_w,
-            "daily_Wh": daily_wh,
-        })
-    return pd.DataFrame(rows)
+NIGERIAN_INVERTERS = {
+    "Growatt 3000W 24V": {"price": 185000, "power": 3000, "voltage": 24},
+    "Victron 5000W 48V": {"price": 450000, "power": 5000, "voltage": 48},
+}
 
-def energy_required_for_backup(total_w, backup_hours, inverter_eff=0.95):
-    """Return Wh required from battery (accounting for inverter efficiency)."""
-    # If loads are AC via inverter, battery must supply more to cover inverter losses
-    return (total_w * backup_hours) / inverter_eff
+# Common Nigerian appliances
+NIGERIAN_APPLIANCES = {
+    "Ceiling Fan": 75,
+    "Standing Fan": 55,
+    "TV (32-inch LED)": 50,
+    "TV (42-inch LED)": 80,
+    "Refrigerator (Medium)": 150,
+    "Deep Freezer": 200,
+    "Air Conditioner (1HP)": 750,
+    "Air Conditioner (1.5HP)": 1100,
+    "Water Pump (1HP)": 750,
+    "Lighting (LED Bulb)": 10,
+}
 
-def battery_ah_for_voltage(energy_wh, battery_voltage, dod=0.8):
-    """Energy_wh usable = Ah * V * dod => Ah = energy_wh / (V * dod)"""
-    if battery_voltage <= 0 or dod <= 0:
-        return None
-    return energy_wh / (battery_voltage * dod)
+st.set_page_config(page_title="Annur Tech Solar Planner", layout="wide", page_icon="☀️")
 
-def num_battery_units(ah_required, unit_capacity_ah):
-    if unit_capacity_ah is None or unit_capacity_ah <= 0:
-        return None
-    return ah_required / unit_capacity_ah
+# Custom CSS
+st.markdown(f"""
+<style>
+    .main .block-container {{
+        padding-top: 2rem;
+    }}
+    .stApp {{
+        background-color: #f8f9fa;
+    }}
+    .green-header {{
+        background-color: #006400;
+        color: white;
+        padding: 10px;
+        border-radius: 5px;
+        text-align: center;
+    }}
+    .input-label {{
+        font-weight: bold;
+        margin-bottom: 5px;
+        display: block;
+    }}
+    .help-text {{
+        font-size: 12px;
+        color: #666;
+        font-style: italic;
+        margin-top: 3px;
+    }}
+</style>
+""", unsafe_allow_html=True)
 
-def pv_power_to_charge_energy(energy_wh, desired_hours, system_eff=0.75):
-    """Return required PV power in W to deliver energy_wh in desired_hours at system efficiency."""
-    if desired_hours <= 0:
-        return None
-    return energy_wh / (desired_hours * system_eff)
+# App header
+st.markdown(f'<div class="green-header"><h1>⚡ {COMPANY}</h1></div>', unsafe_allow_html=True)
+st.markdown(f'<h3 style="text-align: center; color: #006400;">{MOTTO}</h3>', unsafe_allow_html=True)
 
-def pv_power_from_sunhours(energy_wh, sun_hours, system_eff=0.75):
-    """Return PV power (W) required if you have sun_hours/day to deliver energy_wh in one day."""
-    return pv_power_to_charge_energy(energy_wh, sun_hours, system_eff)
+# Sidebar client info
+st.sidebar.markdown(f'<div class="green-header"><h3>👤 Client Information</h3></div>', unsafe_allow_html=True)
 
-def panels_needed_from_pv_power(pv_power_w, panel_w=300):
-    return pv_power_w / panel_w
-
-def mppt_current_for_pv(pv_power_w, battery_voltage, safety_factor=1.25):
-    """Approx. PV current into MPPT: I = Ppv / Vbattery; apply safety factor."""
-    if battery_voltage <= 0:
-        return None
-    return (pv_power_w / battery_voltage) * safety_factor
-
-def recommend_inverter(total_w):
-    """Recommend inverter sizing: 1.3x surge factor baseline"""
-    return max(total_w * 1.3, 1000)  # at least 1kW recommended
-
-# -----------------------
-# Streamlit UI
-# -----------------------
-st.set_page_config(page_title="Annur Tech Solar Planner", layout="wide", page_icon="💡")
-st.title(f"{BRAND['company']}")
-st.caption(BRAND["motto"])
-
-# Sidebar: client info & system defaults
 with st.sidebar:
-    st.header("Project & Client")
-    client_name = st.text_input("Client name", "")
-    client_phone = st.text_input("Client phone", "")
-    client_email = st.text_input("Client email", "")
-    client_address = st.text_area("Client address", "", height=80)
-    st.markdown("---")
+    with st.expander("Client Details", expanded=True):
+        client_name = st.text_input("Full Name", placeholder="Enter client's full name", key="client_name")
+        client_address = st.text_area("Address", placeholder="Enter complete address", key="client_address")
+        client_phone = st.text_input("Phone Number", placeholder="e.g., 08012345678", key="client_phone")
+        client_email = st.text_input("Email Address", placeholder="client@example.com", key="client_email")
+        project_location = st.selectbox("Project Location", ["Abuja", "Lagos", "Kano", "Port Harcourt", "Kaduna", "Other"], key="project_location")
 
-    st.header("System defaults")
-    inverter_eff = st.slider("Inverter efficiency (%)", 80, 99, 95) / 100.0
-    system_eff = st.slider("PV→Battery system eff (%)", 50, 95, 75) / 100.0
-    default_panel_w = st.selectbox("Default panel W", [250, 300, 350, 400], index=1)
-    st.markdown("---")
-    st.markdown("**Export / PDF**")
-    desired_charge_hours = st.number_input("Desired recharge hours (to refill battery)", min_value=1.0, max_value=24.0, value=4.0)
-    sun_hours = st.number_input("Peak sun hours (hrs/day)", min_value=1.0, max_value=10.0, value=5.0)
+# Session state init
+if "load_data" not in st.session_state:
+    st.session_state.load_data = []
+if "pdf_data" not in st.session_state:
+    st.session_state.pdf_data = None
 
-# Main layout
-col_a, col_b = st.columns([2,1])
+# Main tabs
+tab1, tab2, tab3, tab4 = st.tabs(["🔋 Load Audit", "⚡ System Sizing", "💰 Cost Estimate", "📋 Report"])
 
-with col_a:
-    st.subheader("1) Load audit — add appliances")
-    if "loads" not in st.session_state:
-        st.session_state.loads = []
-    # quick add form
-    with st.form("add_load_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns([3,1,1,1])
-        name = c1.text_input("Appliance", placeholder="e.g. LED light")
-        watt = c2.number_input("W (single)", min_value=0.0, value=60.0)
-        qty = c3.number_input("Qty", min_value=1, value=1, step=1)
-        hours = c4.number_input("Hours/day", min_value=0.0, value=4.0, step=0.5)
-        submitted = st.form_submit_button("Add appliance")
-        if submitted and name:
-            st.session_state.loads.append({"name": name, "watt": watt, "qty": qty, "hours": hours})
-            st.success(f"Added {qty} × {name}")
+# ====== TAB 1 - LOAD AUDIT ======
+with tab1:
+    st.markdown(f'<div class="green-header"><h3>🔋 Load Audit & Energy Assessment</h3></div>', unsafe_allow_html=True)
+    
+    with st.expander("Quick Add Common Appliances", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown('<div class="input-label">Select Common Appliance</div>', unsafe_allow_html=True)
+            selected_appliance = st.selectbox("Select appliance", list(NIGERIAN_APPLIANCES.keys()), key="appliance_select", label_visibility="collapsed")
+        with col2:
+            appliance_wattage = st.number_input("Wattage", value=NIGERIAN_APPLIANCES[selected_appliance], key="appliance_wattage", label_visibility="collapsed")
+        
+        col3, col4 = st.columns(2)
+        with col3:
+            appliance_quantity = st.number_input("Quantity", 1, 100, 1, key="appliance_quantity", label_visibility="collapsed")
+        with col4:
+            appliance_hours = st.number_input("Hours", 0.0, 24.0, 5.0, key="appliance_hours", label_visibility="collapsed")
+        
+        add_appliance = st.button("➕ Add Appliance to Load List", use_container_width=True, key="add_appliance_btn")
 
-    st.markdown("**Current load list**")
-    df_loads = compute_loads_df(st.session_state.loads)
-    if not df_loads.empty:
-        st.dataframe(df_loads[["name","watt","qty","hours","total_w","daily_Wh"]], use_container_width=True)
-        total_w = df_loads["total_w"].sum()
-        total_daily_wh = df_loads["daily_Wh"].sum()
-        st.metric("Total instant load (W)", f"{total_w:.0f} W")
-        st.metric("Total daily energy", f"{total_daily_wh:.0f} Wh/day")
-        if st.button("Clear load list"):
-            st.session_state.loads = []
-            st.experimental_rerun()
+    with st.expander("Custom Appliance Entry", expanded=False):
+        col1, col2, col3, col4 = st.columns(4)
+        custom_appliance = col1.text_input("Appliance name", placeholder="e.g., Water Dispenser", key="custom_name", label_visibility="collapsed")
+        custom_watt = col2.number_input("Custom wattage", 0, 5000, 100, key="custom_watt_input", label_visibility="collapsed")
+        custom_quantity = col3.number_input("Custom quantity", 1, 100, 1, key="custom_quantity_input", label_visibility="collapsed")
+        custom_hours = col4.number_input("Custom hours", 0.0, 24.0, 5.0, key="custom_hours_input", label_visibility="collapsed")
+        add_custom = st.button("➕ Add Custom Appliance", use_container_width=True, key="add_custom_btn")
+
+    # Add appliances to load list
+    if add_appliance and selected_appliance:
+        total_watt = appliance_wattage * appliance_quantity
+        daily_wh = total_watt * appliance_hours
+        st.session_state.load_data.append({
+            "appliance": selected_appliance,
+            "watt": appliance_wattage,
+            "quantity": appliance_quantity,
+            "total_watt": total_watt,
+            "hours": appliance_hours,
+            "wh": daily_wh
+        })
+        st.success(f"Added {appliance_quantity} × {selected_appliance}")
+
+    if add_custom and custom_appliance:
+        total_watt = custom_watt * custom_quantity
+        daily_wh = total_watt * custom_hours
+        st.session_state.load_data.append({
+            "appliance": custom_appliance,
+            "watt": custom_watt,
+            "quantity": custom_quantity,
+            "total_watt": total_watt,
+            "hours": custom_hours,
+            "wh": daily_wh
+        })
+        st.success(f"Added {custom_quantity} × {custom_appliance}")
+
+    # Display load summary
+    if st.session_state.load_data:
+        st.markdown("---")
+        st.subheader("📊 Load Summary")
+        total_wh = sum(item["wh"] for item in st.session_state.load_data)
+        total_watt = sum(item["total_watt"] for item in st.session_state.load_data)
+        df = pd.DataFrame(st.session_state.load_data)
+
+        col1, col2 = st.columns(2)
+        col1.plotly_chart(px.pie(df, values='wh', names='appliance', title='Energy Consumption by Appliance'), use_container_width=True)
+        col2.plotly_chart(px.bar(df, x='appliance', y='wh', title='Daily Energy Consumption (Wh)'), use_container_width=True)
+
+        st.dataframe(df, use_container_width=True)
+        st.metric("Total Power Demand", f"{total_watt} W")
+        st.metric("Total Daily Energy Consumption", f"{total_wh} Wh")
+
+        if st.button("🗑️ Clear All Items", use_container_width=True, key="clear_items_btn"):
+            st.session_state.load_data = []
+            st.session_state.pdf_data = None
+            st.rerun()
     else:
-        st.info("Add appliances using the form above (name, W, qty, hours/day).")
+        st.info("👆 Add appliances to your load list to see the summary here.")
 
-with col_b:
-    st.subheader("2) Backup & battery targets")
-    if "loads" in st.session_state and len(st.session_state.loads) > 0:
-        # user inputs for backup
-        backup_hours = st.number_input("Required backup hours", min_value=1.0, max_value=168.0, value=4.0)
-        st.markdown("**Battery voltage options** — compare results below")
-        volt_options = [12, 24, 48]
-        dod = st.slider("Depth of Discharge (usable fraction %)", 30, 95, 80) / 100.0
-
-        # compute energy needed (accounting for inverter efficiency)
-        total_w = df_loads["total_w"].sum()
-        energy_wh = energy_required_for_backup(total_w, backup_hours, inverter_eff)
-
-        st.metric("Energy required from battery", f"{energy_wh:.0f} Wh (including inverter loss)")
-
-        # show battery Ah per voltage
-        battery_table = []
-        for V in volt_options:
-            ah = battery_ah_for_voltage(energy_wh, V, dod)
-            battery_table.append({"Voltage (V)": V, "Required Ah": round(ah,1), "Equivalent kWh (usable)": round((ah*V*dod)/1000,3)})
-        st.table(pd.DataFrame(battery_table))
-
-        st.markdown("**Choose a battery unit size to compute number of modules**")
-        battery_choice = st.selectbox("Common battery unit", list(COMMON_BATTERIES.keys()))
-        custom_unit_ah = None
-        if COMMON_BATTERIES[battery_choice] is None:
-            custom_unit_ah = st.number_input("Enter battery unit capacity (Ah)", min_value=20.0, value=200.0)
-            unit_ah = custom_unit_ah
-        else:
-            unit_ah = COMMON_BATTERIES[battery_choice]
-
-        # compute number of units per voltage
-        number_table = []
-        for V in volt_options:
-            ah_req = battery_ah_for_voltage(energy_wh, V, dod)
-            n_units = num_battery_units(ah_req, unit_ah)
-            number_table.append({"Voltage (V)": V, "Required Ah": round(ah_req,1), f"Units of {unit_ah}Ah": round(n_units,2)})
-        st.table(pd.DataFrame(number_table))
+# ====== TAB 2 - SYSTEM SIZING ======
+with tab2:
+    st.markdown(f'<div class="green-header"><h3>⚡ System Sizing & Component Selection</h3></div>', unsafe_allow_html=True)
+    
+    if not st.session_state.load_data:
+        st.warning("Please add appliances in the Load Audit tab first.")
     else:
-        st.info("Add loads first to compute battery sizing.")
+        total_wh = sum(item["wh"] for item in st.session_state.load_data)
+        total_watt = sum(item["total_watt"] for item in st.session_state.load_data)
 
-# -----------------------
-# System Sizing (detailed)
-# -----------------------
-st.markdown("---")
-st.header("3) Solar & Charging Planner")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Battery System")
+            backup_time = st.slider("Backup time required (hours)", 1, 24, 5)
+            battery_voltage = st.selectbox("System voltage", [12, 24, 48], index=1)
+            dod_limit = st.slider("Depth of Discharge (%)", 50, 100, 80)
+            
+            try:
+                battery_capacity_ah = (total_wh * backup_time) / (battery_voltage * (dod_limit/100))
+                battery_type = st.selectbox("Battery technology", list(NIGERIAN_BATTERIES.keys()))
+                battery_info = NIGERIAN_BATTERIES[battery_type]
+                num_batteries = battery_capacity_ah / battery_info["capacity"]
 
-if "loads" in st.session_state and len(st.session_state.loads) > 0:
-    # Recompute variables to use below
-    total_w = df_loads["total_w"].sum()
-    total_daily_wh = df_loads["daily_Wh"].sum()
+                st.metric("Required Battery Capacity", f"{battery_capacity_ah:.0f} Ah")
+                st.metric("Number of Batteries Needed", f"{num_batteries:.1f}")
+            except:
+                st.warning("⚠️ Unable to calculate battery requirements.")
 
-    # Ask user: do you want to recharge battery in desired_charge_hours or daily with sun_hours?
-    st.subheader("How quickly do you want to recharge the battery?")
-    charge_mode = st.radio("Charge mode", ["Charge within desired hours (fast)", "Recharge across sun-hours (daily)"])
-    # energy to replenish = energy_wh (as computed earlier) — reuse backup_hours and energy_wh if set above
-    backup_hours = backup_hours if 'backup_hours' in locals() else 4.0
-    energy_wh = energy_required_for_backup(total_w, backup_hours, inverter_eff)
+        with col2:
+            st.subheader("Solar Panel System")
+            sun_hours = st.slider("Sun hours per day (Nigeria average)", 3.0, 8.0, 5.0)
+            system_efficiency = st.slider("System efficiency (%)", 50, 95, 75)
+            panel_type = st.selectbox("Solar panel type", list(NIGERIAN_SOLAR_PANELS.keys()))
+            panel_info = NIGERIAN_SOLAR_PANELS[panel_type]
+            
+            try:
+                required_solar = total_wh / (sun_hours * (system_efficiency/100))
+                num_panels = required_solar / panel_info["vmp"] * (battery_voltage/panel_info["vmp"])
+                controller_current = (required_solar * 1.25) / battery_voltage
 
-    if charge_mode.startswith("Charge within"):
-        desired_hours_local = desired_charge_hours  # from sidebar
-        pv_needed_w = pv_power_to_charge_energy(energy_wh, desired_hours_local, system_eff)
-        st.write(f"To replenish **{energy_wh:.0f} Wh** in **{desired_hours_local} h** at system efficiency {system_eff*100:.0f}% you need approx:")
-        st.metric("PV array power (W)", f"{pv_needed_w:.0f} W")
+                st.metric("Required Solar Capacity", f"{required_solar:.0f} W")
+                st.metric("Number of Panels Needed", f"{num_panels:.1f}")
+                st.metric("Charge Controller Size", f"{controller_current:.0f} A")
+            except:
+                st.warning("⚠️ Unable to calculate solar requirements.")
+
+        st.subheader("Inverter Selection")
+        try:
+            inverter_size = max(total_watt * 1.3, 1000)
+            selected_inverter = st.selectbox("Choose inverter", list(NIGERIAN_INVERTERS.keys()))
+            inverter_info = NIGERIAN_INVERTERS[selected_inverter]
+
+            st.metric("Recommended Inverter Size", f"{inverter_size:.0f} W")
+            st.metric("Selected Inverter", selected_inverter)
+        except:
+            st.warning("⚠️ Unable to calculate inverter requirements.")
+
+# ====== TAB 3 - COST ESTIMATION ======
+with tab3:
+    st.markdown(f'<div class="green-header"><h3>💰 Cost Estimation</h3></div>', unsafe_allow_html=True)
+    
+    if not st.session_state.load_data:
+        st.warning("Please add appliances in the Load Audit tab first.")
     else:
-        pv_needed_w = pv_power_from_sunhours(energy_wh, sun_hours, system_eff)
-        st.write(f"To replenish **{energy_wh:.0f} Wh** across **{sun_hours} sun-hours/day** at system efficiency {system_eff*100:.0f}% you need approx:")
-        st.metric("PV array power (W)", f"{pv_needed_w:.0f} W")
+        try:
+            battery_cost = math.ceil(num_batteries) * battery_info["price"]
+            solar_cost = math.ceil(num_panels) * panel_info["price"]
+            inverter_cost = inverter_info["price"]
+            installation_cost = max(150000, (battery_cost + solar_cost + inverter_cost) * 0.2)
+            total_cost = battery_cost + solar_cost + inverter_cost + installation_cost
 
-    # Panel choices & counts
-    panel_w = st.selectbox("Panel watt rating to use for counting", [250,300,350,400], index=[250,300,350,400].index(default_panel_w))
-    panels_needed = panels_needed_from_pv_power(pv_needed_w, panel_w)
-    st.metric("Panels needed (approx)", f"{math.ceil(panels_needed)} × {panel_w}W")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Battery Cost", f"₦{battery_cost:,.0f}")
+            col2.metric("Solar Panel Cost", f"₦{solar_cost:,.0f}")
+            col3.metric("Inverter Cost", f"₦{inverter_cost:,.0f}")
 
-    # MPPT / Charge controller suggestion
-    st.subheader("MPPT / Charge Controller & Inverter")
-    mppt_current = mppt_current_for_pv(pv_needed_w, battery_voltage if 'battery_voltage' in locals() else 24, safety_factor=1.25)
-    st.write("Assuming battery voltage of 24V (change above in backup section to see other voltages).")
-    st.metric("Recommended MPPT input current (A) (incl. 1.25 safety factor)", f"{mppt_current:.1f} A")
-    inverter_rec = recommend_inverter(total_w)
-    st.metric("Recommended inverter (continuous) size", f"{inverter_rec:.0f} W")
-else:
-    st.info("Add loads above to see solar & charging planner.")
+            st.metric("Installation & Miscellaneous", f"₦{installation_cost:,.0f}")
+            st.metric("Estimated Total System Cost", f"₦{total_cost:,.0f}")
+        except:
+            st.warning("⚠️ Cost calculation failed. Ensure system sizing was successful.")
 
-# -----------------------
-# Cost estimate quick view
-# -----------------------
-st.markdown("---")
-st.header("4) Quick Cost Estimate (optional)")
-if "loads" in st.session_state and len(st.session_state.loads) > 0:
-    # use example unit prices
-    avg_panel_price = 100000  # Naira per panel (example)
-    avg_battery_price = 250000  # Naira per battery unit (example)
-    avg_inverter_price = 200000
-    est_panels = math.ceil(panels_needed) if 'panels_needed' in locals() else 0
-    est_batteries = math.ceil(num_batteries) if 'num_batteries' in locals() else 0
-    est_inverter_cost = avg_inverter_price
-    est_solar_cost = est_panels * avg_panel_price
-    est_battery_cost = est_batteries * avg_battery_price
-    est_total = est_solar_cost + est_battery_cost + est_inverter_cost + 150000
-    st.metric("Estimated total system cost (₦)", f"{est_total:,.0f}")
-else:
-    st.info("Add loads to compute cost estimates.")
-
-# -----------------------
-# PDF generation (Report)
-# -----------------------
-st.markdown("---")
-st.header("5) Generate PDF Proposal / Report")
-
-def create_pdf_report(
-    client_name,
-    client_phone,
-    client_email,
-    client_address,
-    project_location,
-    loads,
-    total_w,
-    total_daily_wh,
-    backup_hours,
-    energy_wh,
-    battery_table,
-    chosen_panel_w,
-    panels_needed,
-    inverter_rec,
-    mppt_current
-):
-    buff = BytesIO()
-    c = canvas.Canvas(buff, pagesize=A4)
-    w, h = A4
-
-    # Watermark on every page: we'll draw once per page when saving
-    def draw_watermark(canv):
-        canv.saveState()
-        canv.setFont("Helvetica-Bold", 48)
-        canv.setFillGray(0.85)
-        canv.translate(w/2, h/2)
-        canv.rotate(45)
-        canv.drawCentredString(0, 0, BRAND["name"])
-        canv.restoreState()
-
-    # Page 1 - Cover & summary
-    draw_watermark(c)
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(30, h-50, BRAND["company"])
-    c.setFont("Helvetica", 10)
-    c.drawString(30, h-68, BRAND["motto"])
-    c.drawString(30, h-82, f"{BRAND['phone']} | {BRAND['email']}")
-    c.drawString(30, h-96, BRAND["address"])
-
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(30, h-130, "Client:")
-    c.setFont("Helvetica", 11)
-    c.drawString(110, h-130, client_name or "Not provided")
-    c.drawString(30, h-146, f"Project Location: {project_location}")
-    c.drawString(30, h-162, f"Date: {datetime.datetime.now().strftime('%Y-%m-%d')}")
-
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(30, h-190, "System Summary")
-    c.setFont("Helvetica", 11)
-    c.drawString(30, h-206, f"Total instantaneous load: {total_w:.0f} W")
-    c.drawString(30, h-222, f"Total daily energy: {total_daily_wh:.0f} Wh/day")
-    c.drawString(30, h-238, f"Backup target: {backup_hours} hours -> Energy to supply: {energy_wh:.0f} Wh")
-
-    # Small table: battery_table (list of dicts per voltage)
-    y = h-270
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(30, y, "Battery sizing by voltage")
-    y -= 16
-    c.setFont("Helvetica", 10)
-    for row in battery_table:
-        c.drawString(30, y, f"{row['Voltage (V)']}: Required Ah = {row['Required Ah']:.1f} Ah (usable kWh ≈ {row['Equivalent kWh (usable)']:.3f} kWh)")
-        y -= 14
-
-    # Page 2 - Panels & MPPT & Wiring notes
-    c.showPage()
-    draw_watermark(c)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(30, h-50, "PV & Charging Plan")
-    c.setFont("Helvetica", 10)
-    c.drawString(30, h-70, f"Recommended PV array size: {pv_needed_w:.0f} W")
-    c.drawString(30, h-86, f"Using ~{math.ceil(panels_needed)} × {chosen_panel_w}W panels")
-    c.drawString(30, h-102, f"Recommended MPPT current (with safety factor): {mppt_current:.1f} A")
-    c.drawString(30, h-118, f"Recommended inverter (continuous): {inverter_rec:.0f} W")
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(30, h-150, "Notes & Wiring (brief)")
-    c.setFont("Helvetica", 10)
-    c.drawString(30, h-166, "• Panels should be arranged in strings to match MPPT input voltage/current.")
-    c.drawString(30, h-182, "• Use PV combiner and string fuses. Size battery cabling per manufacturer's current rating.")
-    c.drawString(30, h-198, "• Verify battery manufacturer's max charge current and inverter start-up surge.")
-
-    # Footer on this page
-    c.setFont("Helvetica", 9)
-    c.drawString(30, 30, f"{BRAND['company']} | {BRAND['phone']} | {BRAND['email']} | {BRAND['address']}")
-    c.showPage()
-
-    # Done; ensure watermark on pages already drawn; save
-    c.save()
-    buff.seek(0)
-    return buff
-
-# Button to generate PDF
-if st.button("📄 Create professional PDF proposal"):
+# ====== TAB 4 - REPORT ======
+with tab4:
+    st.markdown(f'<div class="green-header"><h3>📋 Professional Report</h3></div>', unsafe_allow_html=True)
+    
     if not client_name or not st.session_state.load_data:
-        st.error("Please provide client info and add at least one appliance before generating report.")
+        st.warning("Please fill in client information and add at least one appliance first.")
     else:
-        # Prepare tables and arguments for PDF builder
-        total_w = df_loads["total_w"].sum()
-        total_daily_wh = df_loads["daily_Wh"].sum()
-        backup_hours = backup_hours if 'backup_hours' in locals() else 4.0
-        energy_wh = energy_required_for_backup(total_w, backup_hours, inverter_eff)
+        def create_professional_pdf():
+            buffer = BytesIO()
+            pdf_content = f"""
+            {COMPANY}
+            {MOTTO}
 
-        battery_table = []
-        for V in [12,24,48]:
-            ah_req = battery_ah_for_voltage(energy_wh, V, dod)
-            battery_table.append({
-                "Voltage (V)": V,
-                "Required Ah": ah_req,
-                "Equivalent kWh (usable)": (ah_req*V*dod)/1000
-            })
+            CLIENT INFORMATION
+            ==================
+            Name: {client_name}
+            Address: {client_address}
+            Phone: {client_phone}
+            Email: {client_email if client_email else "Not provided"}
+            Location: {project_location}
+            Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
 
-        # choose chosen_panel_w and panels_needed from above context
-        chosen_panel_w = panel_w
-        panels_needed = panels_needed_from_pv_power(pv_needed_w, chosen_panel_w)
-        inverter_rec = recommend_inverter(total_w)
-        mppt_current = mppt_current_for_pv(pv_needed_w, 24, safety_factor=1.25)
+            Total Energy Demand: {total_wh} Wh/day
+            Total Power Demand: {total_watt} W
 
-        pdf_buffer = create_pdf_report(
-            client_name, client_phone, client_email, client_address,
-            project_location, st.session_state.load_data, total_w,
-            total_daily_wh, backup_hours, energy_wh, battery_table,
-            chosen_panel_w, panels_needed, inverter_rec, mppt_current
-        )
-        st.session_state.pdf_data = pdf_buffer
-        st.success("PDF proposal generated.")
+            SYSTEM SIZING
+            =============
+            Backup Time: {backup_time} hours
+            Battery Voltage: {battery_voltage}V
+            Battery Capacity: {battery_capacity_ah:.0f} Ah
+            Battery Type: {battery_type}
+            Solar Panel Type: {panel_type}
+            Required Solar Capacity: {required_solar:.0f} W
+            Number of Panels: {num_panels:.1f}
+            Charge Controller Size: {controller_current:.0f} A
+            Inverter Size: {inverter_size:.0f} W
+            Inverter Type: {selected_inverter}
 
-if st.session_state.get("pdf_data") is not None:
-    st.download_button(
-        "⬇️ Download generated PDF",
-        data=st.session_state["pdf_data"],
-        file_name=f"AnnurTech_Proposal_{client_name.replace(' ','_') if client_name else 'client'}_{datetime.datetime.now().strftime('%Y%m%d')}.pdf",
-        mime="application/pdf"
-    )
+            FINANCIAL ANALYSIS
+            =================
+            Battery Cost: ₦{battery_cost:,.0f}
+            Solar Panel Cost: ₦{solar_cost:,.0f}
+            Inverter Cost: ₦{inverter_cost:,.0f}
+            Installation Cost: ₦{installation_cost:,.0f}
+            TOTAL SYSTEM COST: ₦{total_cost:,.0f}
+
+            TERMS & CONDITIONS
+            ==================
+            Quote Validity: 30 days
+            Warranty: Manufacturer warranty + 1 year workmanship
+            Payment Terms: 50% advance, 50% upon completion
+            Installation Timeline: 5-7 working days
+            Service: 6 months free maintenance included
+
+            {COMPANY} | {PHONE} | {EMAIL}
+            {ADDRESS}
+            """
+            buffer.write(pdf_content.encode('utf-8'))
+            buffer.seek(0)
+            return buffer
+
+        if st.button("📄 Generate Professional Quotation PDF", use_container_width=True):
+            st.session_state.pdf_data = create_professional_pdf()
+            st.success("Professional quotation generated successfully!")
+
+        if st.session_state.pdf_data is not None:
+            st.download_button(
+                "📥 Download Professional Quotation",
+                data=st.session_state.pdf_data,
+                file_name=f"AnnurTech_Quotation_{client_name.replace(' ', '_')}_{datetime.datetime.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
 
 # Footer
 st.markdown("---")
-st.markdown(f"<div style='text-align:center;color:#666;font-size:12px'>{BRAND['company']} — {BRAND['motto']}<br/>{BRAND['phone']} | {BRAND['email']}<br/>{BRAND['address']}</div>", unsafe_allow_html=True)
+st.markdown(f"""
+<div style="text-align: center; color: #666; font-size: 12px;">
+    {COMPANY} | {PHONE} | {EMAIL}<br/>
+    {ADDRESS}<br/>
+    © {datetime.datetime.now().year} Annur Tech Solar Solutions
+</div>
+""", unsafe_allow_html=True)
